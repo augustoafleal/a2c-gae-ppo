@@ -1,0 +1,196 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import optim
+
+
+class A2C(nn.Module):
+    def __init__(
+        self,
+        n_features: int,
+        n_actions: int,
+        device: torch.device,
+        critic_lr: float,
+        actor_lr: float,
+        n_envs: int,
+        ppo_epochs: int,
+        ppo_batch_size: int,
+        use_ppo: bool = True,
+        clip_coef: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.device = device
+        self.n_envs = n_envs
+        self.use_ppo = use_ppo
+        self.clip_coef = clip_coef
+        self.hidden_size = (64, 64)
+        self.obs_space = n_features
+        critic_layers = [
+            nn.Linear(n_features, self.hidden_size[1]),
+            nn.Tanh(),
+            nn.Linear(self.hidden_size[0], self.hidden_size[1]),
+            nn.Tanh(),
+            nn.Linear(self.hidden_size[0], 1),
+        ]
+
+        actor_layers = [
+            nn.Linear(n_features, self.hidden_size[1]),
+            nn.Tanh(),
+            nn.Linear(self.hidden_size[0], self.hidden_size[1]),
+            nn.Tanh(),
+            nn.Linear(self.hidden_size[0], n_actions),
+        ]
+
+        self.critic = nn.Sequential(*critic_layers).to(self.device)
+        self.actor = nn.Sequential(*actor_layers).to(self.device)
+
+        self.critic_optim = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.ppo_batch_size = ppo_batch_size
+        self.ppo_epochs = ppo_epochs
+
+    def forward(self, x: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
+        state_values = self.critic(x)
+        action_logits_vec = self.actor(x)
+        return (state_values, action_logits_vec)
+
+    def select_action(self, x: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        state_values, action_logits = self.forward(x)
+        dist = torch.distributions.Categorical(logits=action_logits)
+        actions = dist.sample()
+        action_log_probs = dist.log_prob(actions)
+        entropy = dist.entropy()
+        return (actions, action_log_probs, state_values, entropy)
+
+    def update_parameters(self, critic_loss: torch.Tensor, actor_loss: torch.Tensor) -> None:
+        self.critic_optim.zero_grad()
+        critic_loss.backward()
+        self.critic_optim.step()
+
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        self.actor_optim.step()
+
+    def update_agent(self, rollouts, hp):
+        """
+        Atualiza o agente usando PPO (ou A2C se use_ppo=False)
+        rollouts: dict com states, actions, rewards, value_preds, old_log_probs, masks
+        """
+        T, N, obs_dim = rollouts["states"].shape
+        device = rollouts["states"].device
+
+        # --- Calcula vantagens ---
+        advantages = torch.zeros(T, N, device=device)
+        gae = 0.0
+        for t in reversed(range(T - 1)):
+            delta = (
+                rollouts["rewards"][t]
+                + hp["gamma"] * rollouts["value_preds"][t + 1] * rollouts["masks"][t]
+                - rollouts["value_preds"][t]
+            )
+            gae = delta + hp["gamma"] * hp["lam"] * rollouts["masks"][t] * gae
+            advantages[t] = gae
+
+        returns = advantages + rollouts["value_preds"]
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        states_flat = rollouts["states"].reshape(-1, obs_dim)
+        actions_flat = rollouts["actions"].reshape(-1)
+        returns_flat = returns.reshape(-1).detach()
+        old_log_probs_flat = rollouts["old_log_probs"].reshape(-1).detach()
+        advantages_flat = advantages.reshape(-1).detach()
+        entropies_flat = rollouts["entropies"].reshape(-1).detach()
+
+        # PPO: múltiplas epochs e minibatches
+        total_size = states_flat.size(0)
+        actor_loss_epoch = 0
+        critic_loss_epoch = 0
+        entropy_epoch = 0
+        for _ in range(hp.get("ppo_epochs", 4)):
+            perm = torch.randperm(total_size)
+            # for start in range(0, total_size, hp.get("ppo_batch_size", 64)):
+            #    idx = perm[start : start + hp.get("ppo_batch_size", 64)]
+            # minibatch_size = hp["ppo_batch_size"] * hp["n_envs"]  # 32 * 8 = 256
+            for start in range(0, total_size, self.ppo_batch_size):
+                idx = perm[start : start + self.ppo_batch_size]
+                batch_states = states_flat[idx]
+                batch_actions = actions_flat[idx]
+                batch_returns = returns_flat[idx]
+                batch_adv = advantages_flat[idx]
+                batch_old_log_probs = old_log_probs_flat[idx]
+                # --- Forward pass ---
+                new_values, new_logits = self.forward(batch_states)
+                dist = torch.distributions.Categorical(logits=new_logits)
+                new_log_probs = dist.log_prob(batch_actions)
+                entropy = dist.entropy().mean()
+                # --- PPO surrogate loss ---
+                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                surr1 = ratio * batch_adv
+                surr2 = torch.clamp(ratio, 1 - self.clip_coef, 1 + self.clip_coef) * batch_adv
+                actor_loss = -torch.min(surr1, surr2).mean() - hp["ent_coef"] * entropy
+                critic_loss = (batch_returns - new_values.squeeze(-1)).pow(2).mean()
+                # --- Update ---
+                # --- Atualiza ator ---
+                self.actor_optim.zero_grad()
+                actor_loss.backward()
+                self.actor_optim.step()
+                # --- Atualiza crítico ---
+                self.critic_optim.zero_grad()
+                critic_loss.backward()
+                self.critic_optim.step()
+                # self.update_parameters(critic_loss, actor_loss)
+                actor_loss_epoch += actor_loss.item()
+                critic_loss_epoch += critic_loss.item()
+                entropy_epoch += entropy.item()
+        num_updates = (total_size // hp.get("ppo_batch_size", 64)) * hp.get("ppo_epochs", 4)
+        return critic_loss_epoch / num_updates, actor_loss_epoch / num_updates, entropy_epoch / num_updates
+
+    def update_agent(self, rollouts, hp):
+        """
+        Update the agent using plain A2C with GAE, without forward pass inside update.
+        rollouts: dict with states, actions, rewards, value_preds, old_log_probs, masks, entropies
+        """
+
+        T, N, obs_dim = rollouts["states"].shape
+        device = rollouts["states"].device
+
+        # --- 1. Compute advantages using GAE ---
+        advantages = torch.zeros(T, N, device=device)
+        gae = 0.0
+        for t in reversed(range(T - 1)):
+            td_error = (
+                rollouts["rewards"][t]
+                + hp["gamma"] * rollouts["value_preds"][t + 1] * rollouts["masks"][t]
+                - rollouts["value_preds"][t]
+            )
+            gae = td_error + hp["gamma"] * hp["lam"] * rollouts["masks"][t] * gae
+            advantages[t] = gae
+
+        # --- 2. Compute returns ---
+        returns = advantages + rollouts["value_preds"]
+
+        # --- 3. Flatten for batch update ---
+        advantages_flat = advantages.reshape(-1)
+        returns_flat = returns.reshape(-1)
+        old_log_probs_flat = rollouts["old_log_probs"].reshape(-1)
+        entropies_flat = rollouts["entropies"].reshape(-1)
+
+        # --- 4. Compute losses (no forward) ---
+        # Critic loss: MSE of advantages (GAE) or (returns - values)^2
+        critic_loss = advantages.pow(2).mean()  # <-- can also use (returns - value_preds)^2
+        # Actor loss: use detached advantages to avoid gradient through values
+        actor_loss = -(advantages_flat.detach() * old_log_probs_flat).mean() - hp["ent_coef"] * entropies_flat.mean()
+
+        # --- 5. Update Critic ---
+        self.critic_optim.zero_grad()
+        critic_loss.backward()
+        self.critic_optim.step()
+
+        # --- 6. Update Actor ---
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        self.actor_optim.step()
+
+        # --- 7. Return stats ---
+        mean_entropy = entropies_flat.mean().item()
+        return critic_loss.item(), actor_loss.item(), mean_entropy
