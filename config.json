@@ -1,0 +1,22 @@
+{
+    "env_name": "ALE/Breakout-v5",
+    "atari_mode": true,
+    "seed": 123,
+    "n_envs": 8,
+    "n_updates": 1,
+    "n_steps_per_update": 128,
+    "gamma": 0.99,
+    "lam": 0.95,
+    "ent_coef": 0.01,
+    "actor_lr": 0.00025,
+    "critic_lr": 0.00025,
+    "max_episode_steps": 1000,
+    "ppo_epochs": 3,
+    "ppo_batch_size": 256,
+    "agent_type": "ppo",
+    "frame_skip": 4,
+    "stack_size": 4,
+    "clip_coef": 0.1,
+    "render_mode": null,
+    "load_model": ""
+}

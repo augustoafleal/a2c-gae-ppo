@@ -5,10 +5,6 @@ from torch import optim
 
 
 class A2CBase(nn.Module):
-    """
-    Base class with common A2C logic (GAE, advantage computation, update).
-    """
-
     def __init__(
         self,
         n_features,
@@ -21,7 +17,7 @@ class A2CBase(nn.Module):
         ppo_epochs=None,
         ppo_batch_size=None,
         clip_coef=None,
-        stack_size=4,  # NOVO
+        stack_size=4,
     ):
         super().__init__()
         self.device = device
@@ -32,7 +28,7 @@ class A2CBase(nn.Module):
             self.conv1 = nn.Conv2d(in_channels=stack_size, out_channels=32, kernel_size=8, stride=4)
             self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2)
             self.conv3 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1)
-            self.flattened_size = 64 * 7 * 7  # depois de convs e input 84x84
+            self.flattened_size = 64 * 7 * 7
             self.flatten = nn.Flatten()
 
             self.critic = nn.Sequential(nn.Linear(self.flattened_size, 512), nn.ReLU(), nn.Linear(512, 1)).to(device)
@@ -40,7 +36,7 @@ class A2CBase(nn.Module):
             self.actor = nn.Sequential(nn.Linear(self.flattened_size, 512), nn.ReLU(), nn.Linear(512, n_actions)).to(
                 device
             )
-            # --- Optimizer único ---
+
             self.feature_extractor_params = (
                 list(self.conv1.parameters()) + list(self.conv2.parameters()) + list(self.conv3.parameters())
             )
@@ -95,26 +91,17 @@ class A2CBase(nn.Module):
         self.ppo_batch_size = ppo_batch_size
         self.clip_coef = clip_coef
 
-    """
-    def forward(self, x):
-        x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
-        return self.critic(x), self.actor(x)
-    """
-
     def forward(self, x):
         x = torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
         if self.atari_mode:
-            # x esperado: (batch, C, H, W)
             x = torch.relu(self.conv1(x))
             x = torch.relu(self.conv2(x))
             x = torch.relu(self.conv3(x))
-            x = self.flatten(x)  # flatten mantendo batch
-            # x agora shape: (batch, flattened_size)
+            x = self.flatten(x)
             critic_out = self.critic(x)
             actor_out = self.actor(x)
         else:
-            # x esperado: (batch, n_features)
             critic_out = self.critic(x)
             actor_out = self.actor(x)
 
@@ -129,28 +116,13 @@ class A2CBase(nn.Module):
         return actions, log_probs, value, entropy
 
     def update_parameters(self, critic_loss, actor_loss):
-        # self.critic_optim.zero_grad()
-        # critic_loss.backward()
-        # self.critic_optim.step()
-
-        # self.actor_optim.zero_grad()
-        # actor_loss.backward()
-        # self.actor_optim.step()
-        # self.optim.zero_grad()
         self.optim.zero_grad()
-
         total_loss = critic_loss + actor_loss
         total_loss.backward()
-
-        # opcional: clipping global
-        # torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
-
         self.optim.step()
 
 
 class A2CSimple(A2CBase):
-    """Simple A2C update (no multiple epochs, no PPO clipping)"""
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -160,7 +132,6 @@ class A2CSimple(A2CBase):
             obs_dim = C * H * W
         else:
             T, N, obs_dim = rollouts["states"].shape
-        # T, N, _ = rollouts["states"].shape
         device = rollouts["states"].device
 
         advantages = torch.zeros(T, N, device=device)
@@ -187,12 +158,9 @@ class A2CSimple(A2CBase):
 
 
 class PPO(A2CBase):
-    """PPO implementation with multiple epochs and clipping"""
-
     def __init__(self, *args, ppo_epochs=None, ppo_batch_size=None, clip_coef=None, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # validação obrigatória
         if ppo_epochs is None:
             raise ValueError("ppo_epochs must be provided for PPO")
         if ppo_batch_size is None:
@@ -210,10 +178,8 @@ class PPO(A2CBase):
             obs_dim = C * H * W
         else:
             T, N, obs_dim = rollouts["states"].shape
-        # T, N, _ = rollouts["states"].shape
         device = rollouts["states"].device
 
-        # Compute advantages
         advantages = torch.zeros(T, N, device=device)
         gae = 0.0
         for t in reversed(range(T - 1)):
@@ -228,11 +194,9 @@ class PPO(A2CBase):
         returns = advantages + rollouts["value_preds"]
 
         if self.atari_mode:
-            # T, N, C, H, W -> (T*N, C, H, W)
             states_flat = rollouts["states"].reshape(-1, hp["stack_size"], 84, 84)
         else:
             states_flat = rollouts["states"].reshape(-1, obs_dim)
-        # states_flat = rollouts["states"].reshape(-1, obs_dim)
         actions_flat = rollouts["actions"].reshape(-1)
         returns_flat = returns.reshape(-1).detach()
         old_log_probs_flat = rollouts["old_log_probs"].reshape(-1).detach()
@@ -253,28 +217,16 @@ class PPO(A2CBase):
                 batch_adv = advantages_flat[idx]
                 batch_old_log_probs = old_log_probs_flat[idx]
 
-                # Forward
                 new_values, new_logits = self.forward(batch_states)
                 dist = torch.distributions.Categorical(logits=new_logits)
                 new_log_probs = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
 
-                # PPO loss
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_adv
                 surr2 = torch.clamp(ratio, 1 - self.clip_coef, 1 + self.clip_coef) * batch_adv
                 actor_loss = -torch.min(surr1, surr2).mean() - hp["ent_coef"] * entropy
                 critic_loss = (batch_returns - new_values.squeeze(-1)).pow(2).mean()
-
-                ## Critic
-                # self.critic_optim.zero_grad()
-                # critic_loss.backward()
-                # self.critic_optim.step()
-
-                ## Actor
-                # self.actor_optim.zero_grad()
-                # actor_loss.backward()
-                # self.actor_optim.step()
 
                 self.update_parameters(critic_loss, actor_loss)
 
