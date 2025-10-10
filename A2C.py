@@ -25,35 +25,34 @@ class A2CBase(nn.Module):
         self.atari_mode = atari_mode
 
         if atari_mode:
-            self.conv1 = nn.Conv2d(in_channels=stack_size, out_channels=32, kernel_size=8, stride=4)
-            self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2)
-            self.conv3 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1)
-            self.flattened_size = 64 * 7 * 7
+            self.conv1 = nn.Conv2d(in_channels=stack_size, out_channels=16, kernel_size=8, stride=4)
+            self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2)
+
+            self.flattened_size = 32 * 9 * 9
             self.flatten = nn.Flatten()
 
-            self.critic = nn.Sequential(nn.Linear(self.flattened_size, 512), nn.ReLU(), nn.Linear(512, 1)).to(device)
+            self.fc = nn.Sequential(nn.Linear(self.flattened_size, 256), nn.ReLU()).to(device)
 
-            self.actor = nn.Sequential(nn.Linear(self.flattened_size, 512), nn.ReLU(), nn.Linear(512, n_actions)).to(
-                device
+            self.critic = nn.Linear(256, 1).to(device)
+            self.actor = nn.Linear(256, n_actions).to(device)
+            self.feature_extractor_params = list(self.conv1.parameters()) + list(self.conv2.parameters())
+
+            self.critic_optim = optim.RMSprop(
+                list(self.critic.parameters()) + self.feature_extractor_params, lr=critic_lr
             )
+            self.actor_optim = optim.RMSprop(list(self.actor.parameters()) + self.feature_extractor_params, lr=actor_lr)
 
-            self.feature_extractor_params = (
-                list(self.conv1.parameters()) + list(self.conv2.parameters()) + list(self.conv3.parameters())
-            )
-
-            self.critic_optim = optim.Adam(list(self.critic.parameters()) + self.feature_extractor_params, lr=critic_lr)
-            self.actor_optim = optim.Adam(list(self.actor.parameters()) + self.feature_extractor_params, lr=actor_lr)
-
-            trunk_params = list(self.conv1.parameters()) + list(self.conv2.parameters()) + list(self.conv3.parameters())
-            self.optim = optim.Adam(
+            self.optim = optim.RMSprop(
                 [
-                    {"params": trunk_params, "lr": actor_lr},  # feature extractor
-                    {"params": self.actor.parameters(), "lr": actor_lr},  # política
-                    {"params": self.critic.parameters(), "lr": critic_lr},  # crítico
+                    {"params": self.conv1.parameters()},
+                    {"params": self.conv2.parameters()},
+                    {"params": self.fc.parameters()},
+                    {"params": self.actor.parameters()},
+                    {"params": self.critic.parameters()},
                 ],
-                betas=(0.9, 0.999),
-                eps=1e-8,
-                weight_decay=0,
+                lr=actor_lr,
+                alpha=0.99,
+                eps=1e-5,
             )
 
         else:
@@ -97,10 +96,10 @@ class A2CBase(nn.Module):
         if self.atari_mode:
             x = torch.relu(self.conv1(x))
             x = torch.relu(self.conv2(x))
-            x = torch.relu(self.conv3(x))
             x = self.flatten(x)
+            x = self.fc(x)
             critic_out = self.critic(x)
-            actor_out = self.actor(x)
+            actor_out = torch.softmax(self.actor(x), dim=-1)
         else:
             critic_out = self.critic(x)
             actor_out = self.actor(x)

@@ -6,9 +6,9 @@ import ale_py
 from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
 from A2C import A2C
-from Logger import Logger
-from RenderRecorder import RenderRecorder
-from AtariUtils import FireResetEnv
+from util.Logger import Logger
+from util.RenderRecorder import RenderRecorder
+from util.AtariUtils import FireResetEnv
 
 
 def make_gym_atari_env(env_id, num_envs, seed=0, frame_skip=4, stack_size=4, render_mode=None):
