@@ -2,8 +2,8 @@ import torch
 import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
-from RenderRecorder import RenderRecorder
-from AtariUtils import FireResetEnv
+from util.RenderRecorder import RenderRecorder
+from util.AtariUtils import FireResetEnv
 
 
 def make_render_env(env_id, atari_mode, stack_size=4, seed=0):
