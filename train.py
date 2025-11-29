@@ -83,7 +83,12 @@ def run(hp, device):
         ppo_batch_size=hp["ppo_batch_size"],
         clip_coef=hp.get("clip_coef", 0.1),
     )
-    logger = Logger()
+
+    logger = Logger(
+        episode_filename=f"logs/{hp["agent_type"]}_episodes_{hp['run_id']}.csv",
+        update_filename=f"logs/{hp["agent_type"]}_updates_{hp['run_id']}.csv",
+        resources_filename=f"logs/{hp["agent_type"]}_resources_{hp['run_id']}.csv",
+    )
 
     states, _ = envs.reset(seed=hp["seed"])
     episode_rewards = np.zeros(hp["n_envs"], dtype=np.float32)
@@ -91,11 +96,19 @@ def run(hp, device):
     worker_episodes = np.zeros(hp["n_envs"], dtype=int)
 
     total_time_steps = 0
-    max_time_steps = 10_000_000
+    max_time_steps = hp["max_time_steps"]
     update = 0
     start_time = time.time()
+    total_iteration = 0
+    max_iteration = 0
 
-    while total_time_steps < max_time_steps:
+    if hp["atari_mode"]:
+        max_iterarion = hp["max_episode_steps"]
+    else:
+        max_iterarion = hp["max_episodes"]
+    print(f"Max iteration per env: {max_iterarion}")
+
+    while total_iteration < max_iteration:
         update_start_time = time.time()
         update += 1
 
@@ -125,7 +138,7 @@ def run(hp, device):
             for i, done in enumerate(np.logical_or(terminated, truncated)):
                 if done:
                     last_episode_rewards[i] = episode_rewards[i]
-                    logger.log(
+                    logger.log_episode(
                         worker=i,
                         episode=worker_episodes[i],
                         total_steps=update * hp["n_steps_per_update"] + step,
@@ -149,6 +162,16 @@ def run(hp, device):
         critic_losses.append(critic_loss)
         actor_losses.append(actor_loss)
         entropies.append(entropy)
+
+        logger.log_update(
+            update_num=update,
+            critic_loss=critic_loss,
+            actor_loss=actor_loss,
+            entropy=entropy,
+            total_steps=total_time_steps,
+            # log_resources=(update % 5 == 0),
+            log_resources=True,
+        )
 
         mean_reward = rollouts["rewards"].sum(dim=0).mean().cpu().item()
         update_time = time.time() - update_start_time
