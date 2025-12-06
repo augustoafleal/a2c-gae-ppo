@@ -166,7 +166,9 @@ class A2CSimple(A2CBase):
 
 
 class PPO(A2CBase):
-    def __init__(self, *args, ppo_epochs=None, ppo_batch_size=None, clip_coef=None, **kwargs):
+    def __init__(
+        self, *args, ppo_epochs=None, ppo_batch_size=None, clip_coef=None, is_continuous_actions=False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
 
         if ppo_epochs is None:
@@ -179,6 +181,123 @@ class PPO(A2CBase):
         self.ppo_epochs = ppo_epochs
         self.ppo_batch_size = ppo_batch_size
         self.clip_coef = clip_coef
+
+        self.is_continuous_actions = is_continuous_actions
+
+        if self.atari_mode:
+            self.conv1 = nn.Conv2d(in_channels=self.stack_size, out_channels=16, kernel_size=8, stride=4).to(
+                self.device
+            )
+            self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=4, stride=2).to(self.device)
+            self.flattened_size = 32 * 9 * 9
+            self.flatten = nn.Flatten()
+            self.fc = nn.Sequential(nn.Linear(self.flattened_size, 256), nn.ReLU()).to(self.device)
+
+            if self.is_continuous_actions:
+                self.actor = nn.Sequential(
+                    nn.Linear(256, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, self.n_actions),
+                    nn.Tanh(),
+                ).to(self.device)
+                self.log_std = nn.Parameter(torch.zeros(self.n_actions, device=self.device))
+            else:
+                self.actor = nn.Linear(256, self.n_actions).to(self.device)
+            self.critic = nn.Linear(256, 1).to(self.device)
+
+            self.feature_extractor_params = list(self.conv1.parameters()) + list(self.conv2.parameters())
+
+            self.optim = optim.RMSprop(
+                [
+                    {"params": self.conv1.parameters()},
+                    {"params": self.conv2.parameters()},
+                    {"params": self.fc.parameters()},
+                    {"params": self.actor.parameters()},
+                    {"params": self.critic.parameters()},
+                ],
+                lr=getattr(self, "actor_lr", 7e-4),
+                alpha=0.99,
+                eps=1e-5,
+            )
+        else:
+            if self.is_continuous_actions:
+                self.actor = nn.Sequential(
+                    nn.Linear(self.n_features, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, self.n_actions),
+                    nn.Tanh(),
+                ).to(self.device)
+                self.log_std = nn.Parameter(torch.zeros(self.n_actions, device=self.device))
+                self.critic = nn.Sequential(
+                    nn.Linear(self.n_features, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, 1),
+                ).to(self.device)
+                self.optim = optim.Adam(
+                    [
+                        {"params": self.actor.parameters()},
+                        {"params": self.critic.parameters()},
+                        {"params": [self.log_std]},
+                    ],
+                    lr=getattr(self, "actor_lr", 3e-4),
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                )
+            else:
+                self.actor = nn.Sequential(
+                    nn.Linear(self.n_features, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, self.n_actions),
+                ).to(self.device)
+                self.critic = nn.Sequential(
+                    nn.Linear(self.n_features, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, 1),
+                ).to(self.device)
+                self.optim = optim.Adam(
+                    [{"params": list(self.actor.parameters()) + list(self.critic.parameters())}],
+                    lr=getattr(self, "actor_lr", 3e-4),
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                )
+
+    def select_action(self, state):
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        value, logits = self.forward(state)
+
+        if self.is_continuous_actions:
+            mean = logits
+            std = self.log_std.exp()
+            dist = torch.distributions.Normal(mean, std)
+
+            raw_action = dist.rsample()
+            action = torch.tanh(raw_action)
+
+            gaussian_logp = dist.log_prob(raw_action).sum(-1)
+            squash_correction = torch.log(1 - action.pow(2) + 1e-6).sum(-1)
+            log_prob = gaussian_logp - squash_correction
+
+            entropy = dist.entropy().sum(-1)
+
+            return action, log_prob, value, entropy, raw_action
+
+        else:
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            entropy = dist.entropy()
+
+            return action, log_prob, value, entropy
 
     def update_agent(self, rollouts, hp):
         if self.atari_mode:
@@ -205,7 +324,12 @@ class PPO(A2CBase):
             states_flat = rollouts["states"].reshape(-1, hp["stack_size"], 84, 84)
         else:
             states_flat = rollouts["states"].reshape(-1, obs_dim)
-        actions_flat = rollouts["actions"].reshape(-1)
+
+        if self.is_continuous_actions:
+            actions_flat = rollouts["actions"].reshape(-1, self.n_actions)
+        else:
+            actions_flat = rollouts["actions"].reshape(-1)
+
         returns_flat = returns.reshape(-1).detach()
         old_log_probs_flat = rollouts["old_log_probs"].reshape(-1).detach()
         advantages_flat = advantages.reshape(-1).detach()
@@ -226,15 +350,33 @@ class PPO(A2CBase):
                 batch_old_log_probs = old_log_probs_flat[idx]
 
                 new_values, new_logits = self.forward(batch_states)
-                dist = torch.distributions.Categorical(logits=new_logits)
-                new_log_probs = dist.log_prob(batch_actions)
-                entropy = dist.entropy().mean()
+
+                if self.is_continuous_actions:
+                    mean = new_logits
+                    std = self.log_std.exp()
+                    dist = torch.distributions.Normal(mean, std)
+
+                    raw_actions = batch_actions
+                    if raw_actions.ndim == 1:
+                        raw_actions = raw_actions.unsqueeze(-1)
+
+                    gaussian_logp = dist.log_prob(raw_actions).sum(-1)
+                    squash_correction = torch.log(1 - torch.tanh(raw_actions).pow(2) + 1e-6).sum(-1)
+                    new_log_probs = gaussian_logp - squash_correction
+
+                    entropy = dist.entropy().sum(-1).mean()
+
+                else:
+                    dist = torch.distributions.Categorical(logits=new_logits)
+                    new_log_probs = dist.log_prob(batch_actions)
+                    entropy = dist.entropy().mean()
 
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_adv
                 surr2 = torch.clamp(ratio, 1 - self.clip_coef, 1 + self.clip_coef) * batch_adv
                 actor_loss = -torch.min(surr1, surr2).mean() - hp["ent_coef"] * entropy
                 critic_loss = (batch_returns - new_values.squeeze(-1)).pow(2).mean()
+                critic_loss = critic_loss * hp["vf_coef"]
 
                 self.update_parameters(critic_loss, actor_loss)
 
@@ -530,6 +672,8 @@ class GRPO(A2CBase):
         adv_cat = adv_cat.detach()
 
         total_size = states_cat.shape[0]
+        print(f"Total size: {total_size}")
+
         actor_loss_epoch = 0.0
         entropy_epoch = 0.0
         num_updates = 0

@@ -68,7 +68,13 @@ def run(hp, device):
         envs = make_classic_env(hp["env_name"], hp["n_envs"])
         obs_space = envs.single_observation_space.shape[0]
 
-    act_space = envs.single_action_space.n
+    action_space = envs.single_action_space
+    if hp["is_continuous_actions"]:
+        is_continuous = True
+        act_space = action_space.shape[0]
+    else:
+        is_continuous = False
+        act_space = action_space.n
 
     agent = A2C(
         agent_type=hp["agent_type"],
@@ -82,18 +88,20 @@ def run(hp, device):
         ppo_epochs=hp["ppo_epochs"],
         ppo_batch_size=hp["ppo_batch_size"],
         clip_coef=hp.get("clip_coef", 0.1),
+        is_continuous_actions=is_continuous,
     )
 
     logger = Logger(
-        episode_filename=f"logs/{hp["agent_type"]}_episodes_{hp['run_id']}.csv",
-        update_filename=f"logs/{hp["agent_type"]}_updates_{hp['run_id']}.csv",
-        resources_filename=f"logs/{hp["agent_type"]}_resources_{hp['run_id']}.csv",
+        episode_filename=f"logs/{hp['agent_type']}_episodes_{hp['run_id']}.csv",
+        update_filename=f"logs/{hp['agent_type']}_updates_{hp['run_id']}.csv",
+        resources_filename=f"logs/{hp['agent_type']}_resources_{hp['run_id']}.csv",
     )
 
     states, _ = envs.reset(seed=hp["seed"])
     episode_rewards = np.zeros(hp["n_envs"], dtype=np.float32)
     last_episode_rewards = np.zeros(hp["n_envs"], dtype=np.float32)
     worker_episodes = np.zeros(hp["n_envs"], dtype=int)
+    episodes_finished_worker0 = 0
 
     total_time_steps = 0
     max_time_steps = hp["max_time_steps"]
@@ -103,17 +111,24 @@ def run(hp, device):
     max_iteration = 0
 
     if hp["atari_mode"]:
-        max_iterarion = hp["max_episode_steps"]
+        max_iteration = hp["max_episode_steps"]
     else:
-        max_iterarion = hp["max_episodes"]
-    print(f"Max iteration per env: {max_iterarion}")
+        max_iteration = hp["max_episodes"]
+    print(f"Max iteration per env: {max_iteration}")
 
     while total_iteration < max_iteration:
         update_start_time = time.time()
         update += 1
 
+        if is_continuous:
+            actions_shape = (hp["n_steps_per_update"], hp["n_envs"], act_space)
+            actions_dtype = torch.float32
+        else:
+            actions_shape = (hp["n_steps_per_update"], hp["n_envs"])
+            actions_dtype = torch.long
+
         rollouts = {
-            "actions": torch.zeros(hp["n_steps_per_update"], hp["n_envs"], dtype=torch.long, device=device),
+            "actions": torch.zeros(*actions_shape, dtype=actions_dtype, device=device),
             "value_preds": torch.zeros(hp["n_steps_per_update"], hp["n_envs"], device=device),
             "rewards": torch.zeros(hp["n_steps_per_update"], hp["n_envs"], device=device),
             "old_log_probs": torch.zeros(hp["n_steps_per_update"], hp["n_envs"], device=device),
@@ -128,8 +143,19 @@ def run(hp, device):
             rollouts["states"] = torch.zeros(hp["n_steps_per_update"], hp["n_envs"], obs_space, device=device)
 
         for step in range(hp["n_steps_per_update"]):
-            actions, action_log_probs, state_value_preds, entropy = agent.select_action(states)
-            next_states, rewards, terminated, truncated, infos = envs.step(actions.cpu().numpy())
+
+            if is_continuous:
+                actions, action_log_probs, state_value_preds, entropy, raw_actions = agent.select_action(states)
+            else:
+                actions, action_log_probs, state_value_preds, entropy = agent.select_action(states)
+                raw_actions = None
+
+            if isinstance(actions, torch.Tensor):
+                actions_to_env = actions.detach().cpu().numpy()
+            else:
+                actions_to_env = actions
+
+            next_states, rewards, terminated, truncated, infos = envs.step(actions_to_env)
             total_time_steps += hp["n_envs"]
 
             episode_rewards += rewards
@@ -148,13 +174,24 @@ def run(hp, device):
                     worker_episodes[i] += 1
                     episode_rewards[i] = 0.0
 
+                    if (not hp["atari_mode"]) and i == 0:
+                        episodes_finished_worker0 += 1
+
             rollouts["states"][step] = torch.as_tensor(states, device=device)
-            rollouts["actions"][step] = actions
-            rollouts["value_preds"][step] = state_value_preds.squeeze(-1)
+
+            if is_continuous:
+                rollouts["actions"][step] = raw_actions.detach().to(device=device, dtype=torch.float32)
+            else:
+                if isinstance(actions, np.ndarray):
+                    rollouts["actions"][step] = torch.as_tensor(actions, device=device, dtype=torch.long)
+                else:
+                    rollouts["actions"][step] = actions.detach().to(device=device, dtype=torch.long)
+
+            rollouts["value_preds"][step] = state_value_preds.squeeze(-1).detach()
             rollouts["rewards"][step] = torch.as_tensor(rewards, device=device)
-            rollouts["old_log_probs"][step] = action_log_probs
+            rollouts["old_log_probs"][step] = action_log_probs.detach()
             rollouts["masks"][step] = torch.as_tensor(1.0 - np.logical_or(terminated, truncated), device=device)
-            rollouts["entropies"][step] = entropy
+            rollouts["entropies"][step] = entropy.detach()
 
             states = next_states
 
@@ -169,17 +206,29 @@ def run(hp, device):
             actor_loss=actor_loss,
             entropy=entropy,
             total_steps=total_time_steps,
-            # log_resources=(update % 5 == 0),
-            log_resources=True,
+            log_resources=(update % 5 == 0),
         )
+
+        if hp["atari_mode"]:
+            total_iteration += hp["n_steps_per_update"] * hp["n_envs"]
+        else:
+            total_iteration += episodes_finished_worker0
+
+        episodes_finished_worker0 = 0
 
         mean_reward = rollouts["rewards"].sum(dim=0).mean().cpu().item()
         update_time = time.time() - update_start_time
         elapsed_time = time.time() - start_time
-        steps_remaining = max_time_steps - total_time_steps
-        steps_per_update = hp["n_steps_per_update"] * hp["n_envs"]
-        updates_remaining = steps_remaining / steps_per_update
-        eta_seconds = updates_remaining * update_time
+
+        if hp["atari_mode"]:
+            steps_remaining = max(0, max_time_steps - total_time_steps)
+            steps_per_update = hp["n_steps_per_update"] * hp["n_envs"]
+            updates_remaining = steps_remaining / steps_per_update
+            eta_seconds = updates_remaining * update_time
+        else:
+            iterations_remaining = max(0, max_iteration - total_iteration)
+            updates_remaining = iterations_remaining / 1
+            eta_seconds = updates_remaining * update_time
 
         if update % 5 == 0:
             print(
@@ -231,12 +280,27 @@ def run(hp, device):
             if hp["atari_mode"]:
                 state_tensor = torch.as_tensor(state, device=device).unsqueeze(0)
                 action, _, _, _ = agent.select_action(state_tensor)
-                action = action.item()
-            else:
-                action, _, _, _ = agent.select_action(np.expand_dims(state, axis=0))
-                action = action.item()
 
-        next_state, reward, terminated, truncated, _ = test_env.step(action)
+                if isinstance(action, torch.Tensor):
+                    action_np = action.cpu().numpy()
+                else:
+                    action_np = action
+                actions_to_env = int(np.asarray(action_np).item())
+            else:
+                if is_continuous:
+                    actions, action_log_probs, state_value_preds, entropy, raw_actions = agent.select_action(states)
+                else:
+                    actions, action_log_probs, state_value_preds, entropy = agent.select_action(states)
+                    raw_actions = None
+
+            if hp["is_continuous_actions"]:
+                actions_to_env = actions.detach().cpu().numpy()
+                if actions_to_env.ndim > 1:
+                    actions_to_env = actions_to_env[0]
+            else:
+                actions_to_env = int(actions.detach().cpu().numpy().flatten()[0])
+
+        next_state, reward, terminated, truncated, _ = test_env.step(actions_to_env)
         total_reward += reward
 
         frame = test_env.render()
